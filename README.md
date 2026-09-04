@@ -1,26 +1,39 @@
 # MTGA Deck Overlay
 
-A small always-on-top desktop overlay that shows the cards still in **your currently selected / in-match deck**.
+Always-on-top tracker for Magic: The Gathering Arena. Shows cards left in your library, opponent public zones, a Goldfish meta guess, and writes OBS overlays.
 
-It only **reads** Arena's `Player.log`. It does not inject into the process, does not read memory, and does not play cards for you.
+It only **reads** `Player.log`. It does not inject into Arena or read memory.
 
-## What you get
+## Download (Windows)
 
-- Live list of remaining cards while a match is running (library tracker)
-- Opponent public-zone tracker + Goldfish meta guess
-- OBS HTML overlays at 480x1080 (`%LOCALAPPDATA%\\MTGADeckOverlay\\obs`)
-- Count + chance the next card drawn is that card
-- Drag the header to move, minimize, opacity slider, load a `.txt` deck as fallback
+1. Open **[Releases](https://github.com/SkuggiXD/mtga-deck-overlay/releases/latest)**
+2. Download `MTGA Deck Overlay.exe`
+3. In Arena: gear → **View Account** → enable **Detailed Logs (Plugin Support)** → restart Arena
+4. Run Arena windowed or borderless, then double-click the exe
 
-## Setup (Windows)
+First launch Windows SmartScreen may say the app is unrecognized. Click **More info** → **Run anyway**. The build is unsigned.
 
-1. Install [Python 3.10+](https://www.python.org/downloads/) and tick **Add Python to PATH**.
-2. In MTG Arena: Gear → **View Account** → enable **Detailed Logs (Plugin Support)** → restart Arena.
-3. Run Arena windowed or borderless.
-4. Double-click `run.bat`, or `python overlay.py`.
+If there is no release yet, open the repo **Actions** tab → **Build Windows exe** → **Run workflow**. When it finishes, the exe is under that run’s Artifacts.
 
-Build an exe: `build.bat` (needs PyInstaller + Pillow).
+## Run from source
 
-OBS Browser Sources: `playerdeck.html` and `oppdeck.html` in `%LOCALAPPDATA%\\MTGADeckOverlay\\obs` at **480 × 1080**.
+Python 3.10+ on PATH, then:
+
+```bat
+python overlay.py
+```
+
+or double-click `run.bat`. Optional: `python -m pip install pillow`
+
+Build a local exe: `build.bat`
+
+## OBS
+
+While the app is running it writes:
+
+`%LOCALAPPDATA%\\MTGADeckOverlay\\obs\\playerdeck.html`  
+`%LOCALAPPDATA%\\MTGADeckOverlay\\obs\\oppdeck.html`
+
+Add those as Browser Sources at **480 × 1080**. Closing the app blanks the pages.
 
 Unofficial fan content. Not affiliated with Wizards of the Coast.

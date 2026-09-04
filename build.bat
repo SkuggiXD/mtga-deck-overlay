@@ -16,6 +16,9 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --hidden-import tkinter.ttk ^
   --hidden-import tkinter.filedialog ^
   --hidden-import sqlite3 ^
+  --hidden-import core ^
+  --hidden-import features ^
+  --hidden-import ui ^
   --hidden-import ctypes ^
   --collect-all PIL ^
   --collect-submodules tkinter ^

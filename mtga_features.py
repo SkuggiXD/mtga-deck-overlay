@@ -651,8 +651,8 @@ class ObsBridge:
 def _esc(text: str) -> str:
     return (
         str(text)
-        .replace("&", "&")
-        .replace("<", "<")
-        .replace(">", ">")
-        .replace('"', """)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
     )

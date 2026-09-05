@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 
 from core import CardNames, OverlayState, LogParser, LogTailer, find_player_log
-from features import parse_deck_text, DEMO_DECK
+from mtga_features import parse_deck_text, DEMO_DECK
 from ui import launch_ui
 
 

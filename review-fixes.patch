@@ -1,0 +1,75 @@
+--- a/core.py
++++ b/core.py
+@@ -432,7 +432,8 @@
+     def remember_loc(self, loc_id: int, name: str) -> None:
+         if loc_id is None or _looks_like_placeholder(name):
+             return
+-        self.loc_ids[int(loc_id)] = name
++        with self._lock:
++            self.loc_ids[int(loc_id)] = name
+ 
+     def get(self, grp_id: int) -> str:
+         key = str(int(grp_id))
+@@ -448,7 +449,8 @@
+     def resolve_loc(self, loc_id: Optional[int]) -> Optional[str]:
+         if loc_id is None:
+             return None
+-        return self.loc_ids.get(int(loc_id))
++        with self._lock:
++            return self.loc_ids.get(int(loc_id))
+ 
+     def _resolver_loop(self) -> None:
+         while True:
+@@ -464,19 +466,28 @@
+                 time.sleep(0.08)
+ 
+     def _fetch_scryfall(self, grp_id: int) -> Optional[str]:
++        key = str(int(grp_id))
++        with self._lock:
++            existing = self.ids.get(key)
++            if existing and not _looks_like_placeholder(existing, grp_id):
++                return None
+         url = f"https://api.scryfall.com/cards/arena/{grp_id}"
+         try:
+             req = urllib.request.Request(
+                 url,
+-                headers={
+-                    "User-Agent": "mtga-deck-overlay/1.1 (personal overlay; +https://scryfall.com/docs/api)",
+-                    "Accept": "application/json",
+-                },
++                headers=SCRYFALL_UA,
+             )
+             with urllib.request.urlopen(req, timeout=8) as resp:
+                 data = json.loads(resp.read().decode("utf-8"))
+             name = data.get("name")
+-            return name if name else None
++            if not name:
++                return None
++            printed = str(name).split(" // ", 1)[0].strip()
++            # Arena DB / GRE subtypes own basic lands. Scryfall arena IDs
++            # frequently map a Mountain grpId to Island (and vice versa).
++            if printed in BASIC_LANDS or printed.startswith("Snow-Covered"):
++                return None
++            return str(name)
+         except Exception:
+             return None
+ 
+@@ -1054,8 +1065,9 @@
+         cleaned = Counter({k: v for k, v in remaining.items() if v > 0})
+         self.state.library_counts = cleaned
+         left = sum(cleaned.values())
+-        if self.state.in_match or left:
+-            self.state.in_match = True
++        # Library leftovers after a deck load are not a match. Only GRE
++        # ConnectResp / GameInProgress may flip in_match on.
++        if self.state.in_match:
+             started = sum(self.state.start_counts.values()) or left
+             self.state.status = f"In match — {left}/{started} left in library"
+ 
+@@ -1076,7 +1088,6 @@
+             "ZoneType_Stack": "Stack",
+             "ZoneType_Revealed": "Revealed",
+             "ZoneType_Command": "Command",
+-            "ZoneType_Pending": "Pending",
+         }
+         HIDDEN = {"ZoneType_Library", "ZoneType_Hand", "ZoneType_Limbo"}

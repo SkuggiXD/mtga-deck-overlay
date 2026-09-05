@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -84,9 +85,118 @@ def _norm_card(name: str) -> str:
     return n
 
 
+_EVENTISH = re.compile(
+    r"league|challenge|championship|preliminary|qualifier|store championship|\b20\d{2}[- ]",
+    re.I,
+)
+_NAV_NAMES = {
+    "online", "paper", "arena", "decks", "metagame", "standard", "historic",
+    "timeless", "alchemy", "pioneer", "modern", "legacy", "vintage", "pauper",
+}
+
+
+def _looks_like_archetype_name(name: str) -> bool:
+    n = (name or "").strip()
+    if len(n) < 3 or len(n) > 48:
+        return False
+    low = n.lower()
+    if low in _NAV_NAMES:
+        return False
+    if _EVENTISH.search(n):
+        return False
+    if " " not in n and "-" not in n:
+        if re.search(r"\d", n) or n[:1].islower() or re.search(r"[a-z][A-Z]", n):
+            return False
+    return True
+
+
+def _humanize_archetype_slug(slug: str, fmt: str) -> str:
+    s = slug.strip().strip("/")
+    if s.startswith("archetype/"):
+        s = s.split("/", 1)[1]
+    if fmt and s.startswith(fmt + "-"):
+        s = s[len(fmt) + 1 :]
+    s = re.sub(r"-[a-z]{3}$", "", s)
+    s = s.replace("-", " ").strip()
+    return s.title() if s else "Unknown"
+
+
+def _fetch_goldfish(url: str, timeout: int = 20) -> str:
+    req = urllib.request.Request(url, headers=META_UA)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "ignore")
+
+
+def _featured_deck_id(html: str) -> Optional[str]:
+    ids = re.findall(r"/deck/download/(\d+)", html)
+    if ids:
+        return ids[0]
+    for did in re.findall(r"/deck/(\d+)", html):
+        return did
+    return None
+
+
+def _collect_archetypes(fmt: str) -> List[Tuple[str, Optional[str], Optional[str]]]:
+    """Return (display_name, archetype_slug or None, deck_id or None)."""
+    pages = [
+        f"https://www.mtggoldfish.com/metagame/{fmt}",
+        f"https://www.mtggoldfish.com/metagame/{fmt}/full",
+    ]
+    out: List[Tuple[str, Optional[str], Optional[str]]] = []
+    seen = set()
+    for url in pages:
+        try:
+            page = _fetch_goldfish(url)
+        except Exception:
+            continue
+        for m in re.finditer(
+            r'<a([^>]*)href="(/archetype/([^"#]+))"[^>]*>([^<]{0,80})</a>',
+            page,
+            re.I,
+        ):
+            attrs, _path, slug, raw = m.group(1), m.group(2), m.group(3), m.group(4)
+            if "card-image-tile" in (attrs or "").lower():
+                continue
+            name = html.unescape((raw or "").strip())
+            if not _looks_like_archetype_name(name):
+                name = _humanize_archetype_slug(slug, fmt)
+            if slug in seen:
+                continue
+            seen.add(slug)
+            out.append((name, slug, None))
+        for m in re.finditer(
+            r"archetype-tile-title[\s\S]{0,500}?<a[^>]+href=['\"]([^'\"]+)['\"][^>]*>([^<]{2,60})</a>",
+            page,
+            re.I,
+        ):
+            href, name = m.group(1).strip(), html.unescape(m.group(2).strip())
+            if "/archetype/" in href:
+                slug = href.split("/archetype/", 1)[1].split("#", 1)[0].split("?", 1)[0]
+                if slug in seen:
+                    continue
+                if not _looks_like_archetype_name(name):
+                    name = _humanize_archetype_slug(slug, fmt)
+                seen.add(slug)
+                out.append((name, slug, None))
+                continue
+            dm = re.search(r"/deck/(\d+)", href)
+            if not dm or not _looks_like_archetype_name(name):
+                continue
+            did = dm.group(1)
+            if did in seen:
+                continue
+            seen.add(did)
+            out.append((name, None, did))
+    # When Goldfish still publishes /archetype/ slugs, ignore leftover
+    # article/budget tiles that only point at a raw /deck/ id.
+    if any(slug for _n, slug, _d in out):
+        out = [row for row in out if row[1]]
+    return out
+
+
 class MetaEngine:
     MIN_CARDS = 3
-    MAX_DECKS = 22
+    MAX_DECKS = 24
 
     def __init__(self) -> None:
         self.format = "standard"
@@ -177,7 +287,7 @@ class MetaEngine:
                 self._loading = False
 
     def _cache_path(self) -> Path:
-        return CACHE_DIR / f"meta_{self.format}_v2.json"
+        return CACHE_DIR / f"meta_{self.format}_v3.json"
 
     def _ensure_decks(self) -> None:
         with self._lock:
@@ -208,35 +318,22 @@ class MetaEngine:
             self.status = f"Loaded {len(decks)} {self.format} lists"
 
     def _download_meta(self) -> List[Dict[str, Any]]:
-        url = f"https://www.mtggoldfish.com/metagame/{self.format}"
-        req = urllib.request.Request(url, headers=META_UA)
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            html = resp.read().decode("utf-8", "ignore")
-        pairs: List[Tuple[str, str]] = []
-        seen_ids = set()
-        for m in re.finditer(
-            r">([A-Za-z0-9][^<]{2,48})</a>[\s\S]{0,400}?/deck/(\d+)",
-            html,
-        ):
-            name, did = m.group(1).strip(), m.group(2)
-            if name.lower() in ("online", "paper", "arena", "decks", "standard", "historic"):
-                continue
-            if did in seen_ids:
-                continue
-            seen_ids.add(did)
-            pairs.append((name, did))
-        if not pairs:
-            for did in dict.fromkeys(re.findall(r"/deck/(\d+)", html)):
-                pairs.append((f"Deck {did}", did))
+        rows = _collect_archetypes(self.format)[: self.MAX_DECKS]
         decks: List[Dict[str, Any]] = []
-        for name, did in pairs[: self.MAX_DECKS]:
+        for name, slug, did in rows:
             try:
-                dreq = urllib.request.Request(
-                    f"https://www.mtggoldfish.com/deck/download/{did}",
-                    headers=META_UA,
+                url = (
+                    f"https://www.mtggoldfish.com/archetype/{slug}"
+                    if slug
+                    else f"https://www.mtggoldfish.com/deck/{did}"
                 )
-                with urllib.request.urlopen(dreq, timeout=15) as resp:
-                    text = resp.read().decode("utf-8", "ignore")
+                if slug and not did:
+                    arch_html = _fetch_goldfish(url)
+                    did = _featured_deck_id(arch_html)
+                    time.sleep(0.12)
+                if not did:
+                    continue
+                text = _fetch_goldfish(f"https://www.mtggoldfish.com/deck/download/{did}", timeout=15)
                 cards = parse_simple_decklist(text)
                 if sum(cards.values()) < 20:
                     continue
@@ -244,7 +341,8 @@ class MetaEngine:
                     {
                         "name": name,
                         "id": did,
-                        "url": f"https://www.mtggoldfish.com/deck/{did}",
+                        "slug": slug or "",
+                        "url": url,
                         "cards": dict(cards),
                     }
                 )

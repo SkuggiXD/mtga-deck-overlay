@@ -13,9 +13,9 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -52,7 +52,7 @@ jobs:
           Write-Host "Collected core, mtga_features, and ui"
 
       - name: Upload exe artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: MTGA-Deck-Overlay-Windows
           path: dist/MTGA Deck Overlay.exe

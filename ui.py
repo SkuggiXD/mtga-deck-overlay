@@ -15,7 +15,7 @@ from core import (
     OverlayState,
     _looks_like_placeholder,
 )
-from features import (
+from mtga_features import (
     META_FORMATS,
     CardImages,
     MetaEngine,

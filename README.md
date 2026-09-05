@@ -36,4 +36,12 @@ While the app is running it writes:
 
 Add those as Browser Sources at **480 × 1080**. Closing the app blanks the pages.
 
+## License
+
+This project is free software, licensed under the **GNU General Public License v2.0 only** — the same license as the Linux kernel.
+
+See [LICENSE](LICENSE) for the full terms. In short: you may run, study, share, and modify this program. If you distribute it or a modified version, you must also provide the corresponding source under GPLv2.
+
+Copyright (C) 2026 SkuggiXD
+
 Unofficial fan content. Not affiliated with Wizards of the Coast.

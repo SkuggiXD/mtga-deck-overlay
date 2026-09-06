@@ -15,6 +15,7 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --hidden-import core ^
   --hidden-import mtga_features ^
   --hidden-import ui ^
+  --hidden-import match_recap ^
   --hidden-import PIL ^
   --hidden-import PIL.Image ^
   --hidden-import PIL.ImageTk ^

@@ -9,12 +9,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core import (
     BASIC_LANDS,
+    MATCH_DIR,
     OBS_DIR,
     SIDE_PATH,
     CardNames,
     OverlayState,
     _looks_like_placeholder,
 )
+from match_recap import open_folder
 from mtga_features import (
     META_FORMATS,
     CardImages,
@@ -327,15 +329,19 @@ def launch_ui(state: OverlayState, names: CardNames) -> None:
             p = OBS_DIR / name
             if not p.exists():
                 p.write_text("", encoding="utf-8")
-        try:
-            if sys.platform == "win32":
-                os.startfile(str(OBS_DIR))  # type: ignore[attr-defined]
-            elif sys.platform == "darwin":
-                os.system(f'open "{OBS_DIR}"')
-            else:
-                os.system(f'xdg-open "{OBS_DIR}"')
-        except Exception:
-            pass
+        open_folder(OBS_DIR)
+
+    def open_match_logs() -> None:
+        MATCH_DIR.mkdir(exist_ok=True)
+        readme = MATCH_DIR / "README.txt"
+        if not readme.exists():
+            readme.write_text(
+                "Match recaps land here while you play.\n"
+                "Name format: Seat1 vs Seat2 YYYY-MM-DD HHMM.txt\n"
+                "Public zones only — opponent hand and library stay hidden.\n",
+                encoding="utf-8",
+            )
+        open_folder(MATCH_DIR)
 
     tk.Button(
         footer,
@@ -348,6 +354,18 @@ def launch_ui(state: OverlayState, names: CardNames) -> None:
         font=("Segoe UI", 8, "bold"),
         cursor="hand2",
     ).pack(side="left", padx=(8, 2), pady=4)
+
+    tk.Button(
+        footer,
+        text="LOGS",
+        command=open_match_logs,
+        bg=BG2,
+        fg=ACCENT,
+        bd=0,
+        activebackground="#2a2e3a",
+        font=("Segoe UI", 8, "bold"),
+        cursor="hand2",
+    ).pack(side="left", padx=(2, 2), pady=4)
 
     tk.Button(
         footer,

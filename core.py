@@ -62,6 +62,8 @@ SIDE_PATH = CACHE_DIR / "preview_side.txt"
 FORMAT_PATH = CACHE_DIR / "meta_format.txt"
 OBS_DIR = DATA_DIR / "obs"
 OBS_DIR.mkdir(exist_ok=True)
+MATCH_DIR = DATA_DIR / "matches"
+MATCH_DIR.mkdir(exist_ok=True)
 OBS_WIDTH, OBS_HEIGHT = 480, 1080
 META_UA = {
     "User-Agent": "Mozilla/5.0 (compatible; mtga-deck-overlay/1.4; +https://www.mtggoldfish.com)",
@@ -512,6 +514,8 @@ class OverlayState:
     local_seat: Optional[int] = None
     opponent_seat: Optional[int] = None
     opponent_name: str = ""
+    seat_names: Dict[int, str] = field(default_factory=dict)
+    recap_path: str = ""
     # grpId -> {zone_label: count} for currently public opponent cards
     opponent_public: Dict[str, Counter] = field(default_factory=dict)
     # grpIds ever seen from the opponent this game (bounced cards stay here)
@@ -680,6 +684,9 @@ class LogParser:
         self.names = names
         self.my_user_id: Optional[str] = None
         self.pending_name_lookups: set = set()
+        from match_recap import MatchRecap
+
+        self.recap = MatchRecap(state, names, MATCH_DIR)
 
     def ingest_text(self, text: str) -> None:
         if not any(h in text for h in JSON_HINTS) and "gameStateMessage" not in text:
@@ -766,10 +773,15 @@ class LogParser:
             else ""
         )
         players = []
+        match_id = ""
         for node in walk(obj):
-            if isinstance(node, dict) and "reservedPlayers" in node:
+            if not isinstance(node, dict):
+                continue
+            if "reservedPlayers" in node and not players:
                 players = node.get("reservedPlayers") or []
-                break
+            mid = node.get("matchId") or node.get("MatchId") or node.get("matchID")
+            if mid and not match_id:
+                match_id = str(mid)
         with self.state.lock:
             for p in players:
                 if not isinstance(p, dict):
@@ -780,20 +792,22 @@ class LogParser:
                 if self.my_user_id and uid and uid == self.my_user_id and seat:
                     self.state.local_seat = int(seat)
                 if seat and name:
-                    # stash names until we know who we are
-                    if not hasattr(self.state, "_seat_names"):
-                        self.state._seat_names = {}
-                    self.state._seat_names[int(seat)] = name
+                    self.state.seat_names[int(seat)] = str(name)
+                    self.state._seat_names = self.state.seat_names
                 # fallback: first human seat if we don't know ourselves yet
                 if self.state.local_seat is None and seat and not str(p.get("aiId") or ""):
                     pass
-            names_by_seat = getattr(self.state, "_seat_names", {})
+            names_by_seat = self.state.seat_names or getattr(self.state, "_seat_names", {})
             if self.state.local_seat is not None:
                 for s, n in names_by_seat.items():
                     if int(s) != int(self.state.local_seat):
                         self.state.opponent_seat = int(s)
                         self.state.opponent_name = n
                         break
+            try:
+                self.recap.set_players(dict(self.state.seat_names), match_id)
+            except Exception:
+                pass
             if "MatchCompleted" in str(state_type) or "MatchGameRoomStateType_MatchCompleted" in str(state_type):
                 self.state.in_match = False
                 self.state.library_counts = None
@@ -801,6 +815,10 @@ class LogParser:
                 self.state.objects.clear()
                 self.state.zones.clear()
                 self.state.opponent_hold = True
+                try:
+                    self.recap.close_match("Match completed")
+                except Exception:
+                    pass
 
     def _parse_deck_payloads(self, obj: Any) -> None:
         # CourseDeck.MainDeck
@@ -974,6 +992,10 @@ class LogParser:
 
             self._recompute_library_locked()
             self._recompute_opponent_locked()
+            try:
+                self.recap.consume(gsm)
+            except Exception:
+                pass
 
     def _recompute_library_locked(self) -> None:
         """Caller must hold state.lock.

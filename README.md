@@ -1,6 +1,6 @@
 # MTGA Deck Overlay
 
-Always-on-top tracker for Magic: The Gathering Arena. Shows cards left in your library, opponent public zones, a Goldfish meta guess, and writes OBS overlays.
+Always-on-top tracker for Magic: The Gathering Arena. Shows cards left in your library, opponent public zones, a Goldfish meta guess, writes OBS overlays, and saves a public-info match recap.
 
 It only **reads** `Player.log`. It does not inject into Arena or read memory.
 
@@ -35,6 +35,14 @@ While the app is running it writes:
 `%LOCALAPPDATA%\\MTGADeckOverlay\\obs\\oppdeck.html`
 
 Add those as Browser Sources at **480 × 1080**. Closing the app blanks the pages.
+
+## Match recaps
+
+While a match is running the overlay writes a text log of **public** actions (casts, lands, life, combat, game result) to:
+
+`%LOCALAPPDATA%\\MTGADeckOverlay\\matches\\`
+
+Files are named `Seat1 vs Seat2 YYYY-MM-DD HHMM.txt`. Click **LOGS** in the overlay footer to open that folder. Opponent hand and library are not written.
 
 ## License
 

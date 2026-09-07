@@ -38,7 +38,6 @@ _SKIP_ANN = {
     "AnnotationType_Tapped",
     "AnnotationType_TappedAffected",
     "AnnotationType_PhaseOrStepModified",
-    "AnnotationType_Attachment",
     "AnnotationType_CounterAdded",
     "AnnotationType_CounterRemoved",
 }
@@ -106,6 +105,20 @@ def _pt(go: Dict[str, Any]) -> str:
     return f"{p}/{t}"
 
 
+def _type_words(go: Dict[str, Any]) -> List[str]:
+    raw = go.get("cardTypes") or go.get("cardType") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    out = []
+    for t in raw:
+        word = re.sub(r"^(CardType_|cardtype_)", "", str(t), flags=re.I).replace("_", " ").strip()
+        if word.lower() in {"token", "none"}:
+            continue
+        if word:
+            out.append(word.title())
+    return out
+
+
 def _subtype_words(go: Dict[str, Any]) -> List[str]:
     raw = go.get("subtypes") or go.get("subtype") or []
     if isinstance(raw, str):
@@ -146,6 +159,10 @@ class MatchRecap:
         self._mull: Dict[int, int] = {}
         self._kept: Set[int] = set()
         self._last_affector: str = ""
+        self._eot_dumped: Set[int] = set()
+        self._saw_combat = False
+        self._attached: Dict[int, int] = {}
+        self._logged_target: Set[Tuple[str, str]] = set()
 
     def set_players(self, seat_names: Dict[int, str], match_id: str = "") -> None:
         if match_id and match_id != self._match_id and self.path:
@@ -161,6 +178,7 @@ class MatchRecap:
             self._line(f"--- {reason} ---")
             self._game_open = False
         self._final = True
+        self._rewrite_ids()
         self._maybe_rename()
         self.path = None
         self._started = None
@@ -179,6 +197,10 @@ class MatchRecap:
         self._mull.clear()
         self._kept.clear()
         self._last_affector = ""
+        self._eot_dumped.clear()
+        self._saw_combat = False
+        self._attached.clear()
+        self._logged_target.clear()
 
     def note_mulligan(self, seat: Optional[int], decision: str, count: Optional[int] = None) -> None:
         self._ensure_file()
@@ -244,8 +266,6 @@ class MatchRecap:
         if starting or over or self._game_open:
             self._ensure_file()
 
-        self._mulligan_from_players(gsm.get("players") or info.get("players") or [])
-
         turn = gsm.get("turnInfo") or {}
         tnum = turn.get("turnNumber")
         active = turn.get("activePlayer") or turn.get("decisionPlayer")
@@ -265,9 +285,10 @@ class MatchRecap:
             if key != self._turn_key:
                 if self._turn_key is not None:
                     prev_turn = self._turn_key[0]
-                    self._dump_board(f"End of turn {prev_turn}")
+                    self._end_turn(prev_turn)
                 self._turn_key = key
                 self._turn_num = tnum
+                self._saw_combat = False
                 self._line("")
                 self._line(f"Turn {tnum} — {self._who(active)}")
                 self._stack_seen.clear()
@@ -281,16 +302,32 @@ class MatchRecap:
                 "declareblockers",
                 "combatdamage",
             ):
-                if "combat" not in prev.lower() or prev.lower() in ("precombatmain",):
+                if not self._saw_combat:
                     self._line("  — Combat —")
+                    self._saw_combat = True
             if plow in ("ending", "end", "endingphase") or slow in ("end", "cleanup", "endofturn"):
-                self._dump_board(f"End of turn {self._turn_num or '?'}")
+                self._end_turn(self._turn_num)
 
+        self._mulligan_from_players(gsm.get("players") or info.get("players") or [])
+        if self._turn_num == 1 and self._game_open:
+            seats = set(self.state.seat_names or ())
+            if self.state.local_seat is not None:
+                seats.add(int(self.state.local_seat))
+            if self.state.opponent_seat is not None:
+                seats.add(int(self.state.opponent_seat))
+            for s in seats or (1, 2):
+                if int(s) in self._kept:
+                    continue
+                self._kept.add(int(s))
+                n = self._mull.get(int(s))
+                extra = f" after {n} mulligan(s)" if n else " (mulligan count not reported)"
+                self._line(f"  {self._who(int(s))} keeps{extra}")
         self._life_lines(gsm.get("players") or info.get("players") or [])
         self._annotations(gsm.get("annotations") or [])
         self._stack_casts()
         self._attacks(gsm.get("gameObjects") or [])
         self._blocks(gsm.get("gameObjects") or [])
+        self._attachments()
         self._battlefield_diff()
 
         if over and self._game_open:
@@ -304,6 +341,7 @@ class MatchRecap:
                 self._line("  Life: " + ", ".join(bits))
             self._game_open = False
             self._final = True
+            self._rewrite_ids()
             self._maybe_rename()
 
     def _reset_game_trackers(self) -> None:
@@ -319,6 +357,10 @@ class MatchRecap:
         self._mull.clear()
         self._kept.clear()
         self._last_affector = ""
+        self._eot_dumped.clear()
+        self._saw_combat = False
+        self._attached.clear()
+        self._logged_target.clear()
 
     def _desired_name(self) -> str:
         seats = dict(getattr(self.state, "seat_names", {}) or {})
@@ -452,10 +494,13 @@ class MatchRecap:
         pt = _pt(go)
         if pt:
             bits.append(pt)
+        kinds = _type_words(go)
         subs = _subtype_words(go)
+        if kinds:
+            bits.extend(kinds)
         if subs:
             bits.append(" ".join(subs))
-        if _is_token(go):
+        if _is_token(go) and "token" not in " ".join(bits).lower():
             bits.append("token")
         if bits:
             label = " ".join(bits)
@@ -518,11 +563,15 @@ class MatchRecap:
                 self.note_player_mulligan_count(seat_i, mc)
             if "Mulligan" in pending:
                 continue
-            if self._game_open and seat_i not in self._kept and self._turn_num == 1 and mc == self._mull.get(seat_i, 0):
-                # First main-phase sighting after mulligans settle.
-                if self._phase and "main" in self._phase.lower() and seat_i not in self._kept:
-                    self._kept.add(seat_i)
-                    self._line(f"  {self._who(seat_i)} keeps")
+            if (
+                self._game_open
+                and seat_i not in self._kept
+                and self._turn_num == 1
+                and "mulligan" not in pending.lower()
+            ):
+                self._kept.add(seat_i)
+                extra = f" after {self._mull.get(seat_i, 0)} mulligan(s)" if self._mull.get(seat_i) else " (no mulligan)"
+                self._line(f"  {self._who(seat_i)} keeps{extra}")
 
     def _life_lines(self, players: Any) -> None:
         if not isinstance(players, list):
@@ -566,8 +615,9 @@ class MatchRecap:
                     if len(self._seen_ann) > 4000:
                         self._seen_ann = set(list(self._seen_ann)[-2000:])
             types = _ann_types(ann)
+            joined = "".join(types)
             if any(t in _SKIP_ANN for t in types) and not any(
-                k in "".join(types) for k in ("ZoneTransfer", "Damage", "Attack", "Block", "Reveal", "Resolution")
+                k in joined for k in ("ZoneTransfer", "Damage", "Attack", "Block", "Reveal", "Resolution", "Target", "Attach")
             ):
                 continue
             details = _ann_details(ann)
@@ -576,6 +626,15 @@ class MatchRecap:
             if not isinstance(affected, list):
                 affected = [affected] if affected is not None else []
 
+            if any("Target" in t for t in types):
+                self._log_targets(affector, affected, details)
+                continue
+            if any("Attach" in t for t in types):
+                src, _, _ = self._card_name(affector, False)
+                for tgt in affected:
+                    dst, _, _ = self._card_name(tgt, False)
+                    self._log_pair(f"  {src} attaches to {dst}", src, dst)
+                continue
             if any("ZoneTransfer" in t for t in types):
                 self._zone_transfer(details, affector, affected)
                 continue
@@ -861,6 +920,104 @@ class MatchRecap:
                 continue
             self._line(f"  {nm} leaves battlefield → {dest_label}{why}")
         self._bf = now
+
+    def _end_turn(self, turn: Optional[int]) -> None:
+        if turn is None:
+            return
+        try:
+            t = int(turn)
+        except Exception:
+            return
+        if t in self._eot_dumped:
+            return
+        self._eot_dumped.add(t)
+        if not self._saw_combat:
+            self._line("  (no combat)")
+        self._dump_board(f"End of turn {t}")
+        self._saw_combat = False
+
+    def _log_pair(self, line: str, a: str, b: str) -> None:
+        key = (line.strip(), a, b)
+        if key in self._logged_target:
+            return
+        self._logged_target.add(key)
+        if len(self._logged_target) > 400:
+            self._logged_target = set(list(self._logged_target)[-200:])
+        self._line(line)
+
+    def _log_targets(self, affector: Any, affected: List[Any], details: Dict[str, Any]) -> None:
+        src, _, _ = self._card_name(affector, allow_hidden=False)
+        extra = []
+        for key in ("idTarget", "target", "Target"):
+            if details.get(key) is not None:
+                extra.append(details.get(key))
+        ids = list(affected) + extra
+        names = []
+        for iid in ids:
+            nm, seat, _ = self._card_name(iid, allow_hidden=False)
+            if nm == "a card":
+                try:
+                    maybe = int(iid)
+                except Exception:
+                    maybe = None
+                if maybe in (1, 2):
+                    nm = self._who(maybe)
+            if nm and nm != "a card":
+                names.append(nm)
+        if src == "a card" and not names:
+            return
+        if names:
+            self._log_pair(f"  {src} targets {', '.join(dict.fromkeys(names))}", src, ",".join(names))
+        elif src != "a card":
+            self._log_pair(f"  {src} chooses a target", src, "?")
+
+    def _attachments(self) -> None:
+        now: Dict[int, int] = {}
+        for iid, go in self.state.objects.items():
+            attached_to = go.get("attachedTo") or go.get("attachedToInstanceId")
+            attachments = go.get("attachments") or go.get("attachedInstanceIds") or []
+            if attached_to is not None:
+                try:
+                    now[int(iid)] = int(attached_to)
+                except Exception:
+                    pass
+            if isinstance(attachments, int):
+                attachments = [attachments]
+            if isinstance(attachments, list):
+                for aura in attachments:
+                    try:
+                        now[int(aura)] = int(iid)
+                    except Exception:
+                        pass
+        for aura, host in now.items():
+            if self._attached.get(aura) == host:
+                continue
+            self._attached[aura] = host
+            an, _, _ = self._card_name(aura, False)
+            hn, _, _ = self._card_name(host, False)
+            if an == "a card" and hn == "a card":
+                continue
+            self._log_pair(f"  {an} attaches to {hn}", an, hn)
+
+    def _rewrite_ids(self) -> None:
+        if not self.path or not self.path.exists():
+            return
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except Exception:
+            return
+
+        def repl(m):
+            gid = int(m.group(1))
+            pretty = self._pretty_from_grp(gid)
+            return pretty if pretty else m.group(0)
+
+        new = re.sub(r"#(\d+)", repl, text)
+        if new != text:
+            try:
+                self.path.write_text(new, encoding="utf-8")
+            except Exception:
+                pass
 
     def _dump_board(self, title: str) -> None:
         now = self._battlefield_now()

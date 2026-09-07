@@ -43,6 +43,14 @@ _SKIP_ANN = {
 }
 
 _WIN_WORDS = re.compile(r"Win|Won|Victory|Team1Won|Team2Won", re.I)
+
+# Arena token grpIds that Scryfall does not catalog. Coaching logs
+# identified these as Warrior-token / Call-style creates.
+_KNOWN_TOKENS = {
+    95832: "Warrior token",
+    102058: "Warrior token",
+    188727: "Warrior token",
+}
 _SUBTYPE = re.compile(r"(?:SubType_|subtype_)?", re.I)
 
 
@@ -95,7 +103,45 @@ def _is_token(go: Dict[str, Any]) -> bool:
     types = go.get("cardTypes") or go.get("cardType") or []
     if isinstance(types, str):
         types = [types]
-    return any("Token" in str(t) for t in types)
+    if any("Token" in str(t) for t in types):
+        return True
+    ot = str(go.get("type") or go.get("objectType") or "")
+    return "Token" in ot
+
+
+def _is_ability(go: Dict[str, Any]) -> bool:
+    ot = str(go.get("type") or go.get("objectType") or "")
+    if "Ability" in ot:
+        return True
+    types = go.get("cardTypes") or go.get("cardType") or []
+    if isinstance(types, str):
+        types = [types]
+    if any("Ability" in str(t) for t in types):
+        return True
+    if go.get("parentId") is not None or go.get("parentInstanceId") is not None:
+        return True
+    if go.get("abilityGrpId") and not go.get("grpId"):
+        return True
+    return False
+
+
+def _split_faces(name: str) -> Tuple[str, Optional[str]]:
+    if " // " not in (name or ""):
+        return name, None
+    front, back = name.split(" // ", 1)
+    return front.strip(), back.strip()
+
+
+def _face_name(name: str, go: Dict[str, Any]) -> str:
+    front, back = _split_faces(name)
+    if not back:
+        return front
+    kinds = [k.lower() for k in _type_words(go)]
+    if _is_ability(go):
+        return front
+    if any(k in kinds for k in ("instant", "sorcery", "adventure")):
+        return back
+    return front
 
 
 def _pt(go: Dict[str, Any]) -> str:
@@ -470,12 +516,20 @@ class MatchRecap:
         loc = self.names.resolve_loc(gid)
         if loc and not _looks_like_placeholder(loc, gid):
             return loc
+        if gid in _KNOWN_TOKENS:
+            return _KNOWN_TOKENS[gid]
         return None
 
     def _describe_go(self, go: Dict[str, Any], grp: Optional[int]) -> str:
+        if grp is not None and int(grp) in _KNOWN_TOKENS and (
+            _is_token(go) or not self._pretty_from_grp(grp) or _looks_like_placeholder(self._pretty_from_grp(grp), grp)
+        ):
+            # Prefer the token label over a wrong parent-card decode.
+            if _is_token(go) or self._pretty_from_grp(grp) is None:
+                return _KNOWN_TOKENS[int(grp)]
         pretty = self._pretty_from_grp(grp)
         if pretty:
-            return pretty
+            return _face_name(pretty, go)
         loc = go.get("name")
         if loc is not None and not isinstance(loc, str):
             hit = self.names.resolve_loc(loc)
@@ -507,6 +561,8 @@ class MatchRecap:
             if grp:
                 return f"{label} (#{int(grp)})"
             return label
+        if grp and int(grp) in _KNOWN_TOKENS:
+            return _KNOWN_TOKENS[int(grp)]
         if grp:
             return f"#{int(grp)}"
         return "a card"
@@ -693,11 +749,13 @@ class MatchRecap:
                         self._line(f"  {blk} blocks")
                 continue
             if any("ResolutionStart" in t or "ResolutionComplete" in t for t in types):
+                go = self.state.objects.get(int(affector)) if affector is not None else {}
+                if isinstance(go, dict) and _is_ability(go):
+                    continue
                 nm, seat, _ = self._card_name(affector, allow_hidden=False)
                 if nm != "a card" and "Start" in "".join(types):
                     if affector not in self._logged_cast:
-                        who = self._who(seat)
-                        self._line(f"  {who} resolves {nm}")
+                        self._line(f"  {self._who(seat)} resolves {nm}")
 
     def _zone_transfer(self, details: Dict[str, Any], affector: Any, affected: List[Any]) -> None:
         cat = str(details.get("category") or details.get("Category") or "")
@@ -720,12 +778,24 @@ class MatchRecap:
         for iid in iids:
             nm, seat, _ = self._card_name(iid, allow_hidden=allow_hidden)
             who = self._who(seat)
-            if cat == "CastSpell" or (dest_t == "ZoneType_Stack" and cat in ("", "Cast", "Play")):
-                self._line(f"  {who} casts {nm}")
+            if dest_t == "ZoneType_Limbo" or src_t == "ZoneType_Limbo":
+                continue
+            go = self.state.objects.get(int(iid)) if str(iid).lstrip("-").isdigit() else {}
+            if not isinstance(go, dict):
+                go = {}
+            ability = _is_ability(go) or cat in ("ActivateAbility", "Trigger", "TriggeredAbility", "Ability")
+            if cat == "CastSpell" or (dest_t == "ZoneType_Stack" and cat in ("", "Cast", "Play", "ActivateAbility", "Trigger", "TriggeredAbility")):
                 try:
-                    self._logged_cast.add(int(iid))
+                    iid_i = int(iid)
                 except Exception:
-                    pass
+                    iid_i = None
+                if iid_i is not None and iid_i in self._logged_cast:
+                    continue
+                verb = "triggers" if ability else "casts"
+                self._line(f"  {who} {verb} {nm}")
+                if iid_i is not None:
+                    self._logged_cast.add(iid_i)
+                continue
             elif cat == "PlayLand":
                 self._line(f"  {who} plays {nm}")
             elif cat == "Draw":
@@ -736,7 +806,7 @@ class MatchRecap:
                 self._line(f"  {who} mulligan-sends {nm}")
             elif cat == "Mill" or (src_t == "ZoneType_Library" and dest_t == "ZoneType_Graveyard" and cat != "Resolve"):
                 self._line(f"  {who} mills {nm}")
-            elif src_t == "ZoneType_Battlefield" and dest_t != "ZoneType_Battlefield":
+            elif src_t == "ZoneType_Battlefield" and dest_t not in ("ZoneType_Battlefield", "ZoneType_Limbo"):
                 why = f" ({cause})" if cause else (f" ({cat})" if cat else "")
                 verb = {
                     "ZoneType_Exile": "exiled",
@@ -782,10 +852,12 @@ class MatchRecap:
         for iid in now - self._stack_seen:
             if iid in self._logged_cast:
                 continue
+            go = self.state.objects.get(iid) or {}
             nm, seat, _ = self._card_name(iid, allow_hidden=False)
             if nm == "a card":
                 continue
-            self._line(f"  {self._who(seat)} casts {nm}")
+            verb = "triggers" if _is_ability(go) else "casts"
+            self._line(f"  {self._who(seat)} {verb} {nm}")
             self._logged_cast.add(iid)
         self._stack_seen = now
 

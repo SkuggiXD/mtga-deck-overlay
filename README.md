@@ -13,8 +13,7 @@ It only **reads** `Player.log`. It does not inject into Arena or read memory.
 
 First launch Windows SmartScreen may say the app is unrecognized. Click **More info** → **Run anyway**. The build is unsigned.
 
-If there is no release yet, open the repo **Actions** tab → **Build Windows exe** → **Run workflow**. When it finishes, the exe is under that run’s Artifacts.
-
+Latest: **[v1.2.0](https://github.com/SkuggiXD/mtga-deck-overlay/releases/tag/v1.2.0)** — `MTGA Deck Overlay.exe`.
 ## Run from source
 
 Python 3.10+ on PATH, then:

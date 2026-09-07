@@ -50,6 +50,7 @@ _KNOWN_TOKENS = {
     95832: "Warrior token",
     102058: "Warrior token",
     188727: "Warrior token",
+    88024: "Fetch land",
 }
 _SUBTYPE = re.compile(r"(?:SubType_|subtype_)?", re.I)
 
@@ -209,6 +210,8 @@ class MatchRecap:
         self._saw_combat = False
         self._attached: Dict[int, int] = {}
         self._logged_target: Set[Tuple[str, str]] = set()
+        self._life_commit: Dict[int, int] = {}
+        self._life_candidate: Dict[int, int] = {}
 
     def set_players(self, seat_names: Dict[int, str], match_id: str = "") -> None:
         if match_id and match_id != self._match_id and self.path:
@@ -247,6 +250,8 @@ class MatchRecap:
         self._saw_combat = False
         self._attached.clear()
         self._logged_target.clear()
+        self._life_commit.clear()
+        self._life_candidate.clear()
 
     def note_mulligan(self, seat: Optional[int], decision: str, count: Optional[int] = None) -> None:
         self._ensure_file()
@@ -375,15 +380,18 @@ class MatchRecap:
         self._blocks(gsm.get("gameObjects") or [])
         self._attachments()
         self._battlefield_diff()
+        self._flush_life(force=False)
 
         if over and self._game_open:
+            self._flush_life(force=True)
             self._dump_board("Final board")
             winner = self._winner_text(info, gsm)
             self._line(f"========== Game {self._game_no or '?'} over ==========")
             if winner:
                 self._line(f"  {winner}")
-            if self._life:
-                bits = [f"{self._who(s)} {hp}" for s, hp in sorted(self._life.items())]
+            shown = self._life_commit or self._life
+            if shown:
+                bits = [f"{self._who(s)} {hp}" for s, hp in sorted(shown.items())]
                 self._line("  Life: " + ", ".join(bits))
             self._game_open = False
             self._final = True
@@ -407,6 +415,8 @@ class MatchRecap:
         self._saw_combat = False
         self._attached.clear()
         self._logged_target.clear()
+        self._life_commit.clear()
+        self._life_candidate.clear()
 
     def _desired_name(self) -> str:
         seats = dict(getattr(self.state, "seat_names", {}) or {})
@@ -592,7 +602,14 @@ class MatchRecap:
         )
         if hidden and not (allow_hidden and is_ours) and not (ztype in _PUBLIC_ZONES):
             return ("a card", seat_i, grp_i)
-        return (self._describe_go(go, grp_i), seat_i, grp_i)
+        if _is_ability(go):
+            parent = go.get("parentInstanceId") or go.get("parentId")
+            if parent is not None and int(parent) != iid:
+                pnm, pseat, _ = self._card_name(parent, True)
+                if pnm != "a card" and not (pnm.startswith("#") and pnm[1:].isdigit()):
+                    return (pnm, seat_i or pseat, grp_i)
+        label = self._describe_go(go, grp_i)
+        return (label, seat_i, grp_i)
 
     def _mulligan_from_players(self, players: Any) -> None:
         if not isinstance(players, list):
@@ -645,12 +662,30 @@ class MatchRecap:
                 seat_i, hp = int(seat), int(life)
             except Exception:
                 continue
-            prev = self._life.get(seat_i)
             self._life[seat_i] = hp
-            if prev is not None and prev != hp:
-                delta = hp - prev
+            if seat_i not in self._life_commit:
+                self._life_commit[seat_i] = hp
+
+    def _flush_life(self, force: bool = False) -> None:
+        for seat, hp in list(self._life.items()):
+            committed = self._life_commit.get(seat)
+            if committed is None:
+                self._life_commit[seat] = hp
+                continue
+            cand = self._life_candidate.get(seat)
+            if hp == committed:
+                self._life_candidate.pop(seat, None)
+                continue
+            if not force and cand != hp:
+                # first snapshot of this total; confirm on the next message
+                self._life_candidate[seat] = hp
+                continue
+            if force or cand == hp:
+                delta = hp - committed
                 sign = f"+{delta}" if delta > 0 else str(delta)
-                self._line(f"  {self._who(seat_i)} {prev} → {hp} ({sign})")
+                self._line(f"  {self._who(seat)} {committed} → {hp} ({sign})")
+                self._life_commit[seat] = hp
+                self._life_candidate.pop(seat, None)
 
     def _annotations(self, anns: Any) -> None:
         if not isinstance(anns, list):
@@ -698,6 +733,7 @@ class MatchRecap:
                 amt = details.get("damage") or details.get("Damage") or details.get("amount")
                 src, src_seat, _ = self._card_name(affector, allow_hidden=False)
                 tgt_bits = []
+                hits_player = False
                 for tgt in affected:
                     tgt_name, tgt_seat, _ = self._card_name(tgt, allow_hidden=False)
                     if tgt_name == "a card" and tgt_seat is None:
@@ -706,15 +742,21 @@ class MatchRecap:
                         except Exception:
                             maybe_seat = None
                         if maybe_seat in (1, 2):
-                            tgt_bits.append(self._who(maybe_seat))
+                            hits_player = True
                             continue
+                    if tgt_seat in (1, 2) and tgt_name in ("a card", "", None):
+                        hits_player = True
+                        continue
                     if tgt_name and tgt_name != "a card":
                         tgt_bits.append(tgt_name)
-                    elif tgt_seat is not None:
-                        tgt_bits.append(self._who(tgt_seat))
-                if amt is not None:
-                    extra = (" to " + ", ".join(tgt_bits)) if tgt_bits else ""
-                    self._line(f"  {src} deals {amt} damage{extra}")
+                    elif tgt_seat is not None and tgt_name == "a card":
+                        hits_player = True
+                # Player damage is owned by life-total snapshots so replaced
+                # fights do not print a fake "deals 3 to you".
+                if hits_player and not tgt_bits:
+                    continue
+                if amt is not None and tgt_bits:
+                    self._line(f"  {src} deals {amt} damage to {', '.join(tgt_bits)}")
                 continue
             if any("CardRevealed" in t or "Revealed" in t for t in types):
                 names = []

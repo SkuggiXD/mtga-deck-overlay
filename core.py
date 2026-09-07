@@ -726,6 +726,12 @@ class LogParser:
         if "gameStateMessage" in obj and "greToClientEvent" not in obj:
             self._parse_game_state(obj.get("gameStateMessage") or {})
 
+        client = obj.get("clientToGREMessage") or obj.get("ClientToGREMessage")
+        if isinstance(client, dict):
+            self._parse_client_message(client)
+        elif "Mulligan" in str(obj.get("type") or "") and "clientToGREMessage" not in obj:
+            self._parse_client_message(obj)
+
     def _harvest_names(self, obj: Any) -> None:
         """Pull grpId → title mappings out of whatever Arena logged."""
         for node in walk(obj):
@@ -897,9 +903,44 @@ class LogParser:
                         self.state.status = "Connected to match"
                         self._reset_opponent_for_new_game()
 
+        if "Mulligan" in mtype:
+            self._parse_mulligan_gre(msg)
+
         gsm = msg.get("gameStateMessage")
         if gsm:
             self._parse_game_state(gsm)
+
+    def _parse_mulligan_gre(self, msg: Dict[str, Any]) -> None:
+        seats = msg.get("systemSeatIds") or msg.get("systemSeatId") or []
+        if isinstance(seats, int):
+            seats = [seats]
+        seat = int(seats[0]) if seats else self.state.local_seat
+        blob = msg.get("mulliganReq") or msg.get("mulliganResp") or msg
+        decision = ""
+        if isinstance(blob, dict):
+            decision = str(blob.get("decision") or blob.get("mulliganType") or blob.get("option") or "")
+        if "Req" in str(msg.get("type") or ""):
+            return
+        try:
+            self.recap.note_mulligan(seat, decision or str(msg.get("type") or "mulligan"))
+        except Exception:
+            pass
+
+    def _parse_client_message(self, msg: Dict[str, Any]) -> None:
+        mtype = str(msg.get("type") or "")
+        seats = msg.get("systemSeatId") or msg.get("systemSeatIds") or []
+        if isinstance(seats, int):
+            seats = [seats]
+        seat = int(seats[0]) if seats else self.state.local_seat
+        if "Mulligan" in mtype or msg.get("mulliganResp") or msg.get("mulliganReq"):
+            blob = msg.get("mulliganResp") or msg.get("mulliganReq") or msg
+            decision = ""
+            if isinstance(blob, dict):
+                decision = str(blob.get("decision") or blob.get("mulliganType") or "")
+            try:
+                self.recap.note_mulligan(seat, decision or mtype)
+            except Exception:
+                pass
 
     def _parse_game_state(self, gsm: Dict[str, Any]) -> None:
         if not isinstance(gsm, dict):

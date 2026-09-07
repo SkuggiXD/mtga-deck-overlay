@@ -42,7 +42,9 @@ While a match is running the overlay writes a text log of **public** actions (ca
 
 `%LOCALAPPDATA%\\MTGADeckOverlay\\matches\\`
 
-Files are named `Seat1 vs Seat2 YYYY-MM-DD HHMM.txt`. Click **LOGS** in the overlay footer to open that folder. Opponent hand and library are not written.
+Files are named `Seat1 vs Seat2 YYYY-MM-DD HHMM.txt` while the match is live, then renamed to `… FINAL.txt` when it ends. Click **LOGS** in the overlay footer to open that folder.
+
+Each recap is verbose: casts every turn, end-of-turn boards, blocks and damage, mulligans/keeps, and cards leaving play (exile / bounce / die) with the source card when GRE names it. Opponent hand and library stay unnamed.
 
 ## License
 

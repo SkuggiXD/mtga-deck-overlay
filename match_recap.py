@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+
 def _looks_like_placeholder(name: Optional[str], grp_id: Optional[int] = None) -> bool:
     if not name:
         return True
@@ -15,6 +16,7 @@ def _looks_like_placeholder(name: Optional[str], grp_id: Optional[int] = None) -
     if grp_id is not None and name == str(grp_id):
         return True
     return False
+
 
 _PUBLIC_ZONES = {
     "ZoneType_Battlefield",
@@ -32,7 +34,7 @@ _SKIP_ANN = {
     "AnnotationType_Layer",
     "AnnotationType_ModifiedPower",
     "AnnotationType_ModifiedToughness",
-    "AnnotationType_ModifiedLife",  # life is written from player totals
+    "AnnotationType_ModifiedLife",
     "AnnotationType_Tapped",
     "AnnotationType_TappedAffected",
     "AnnotationType_PhaseOrStepModified",
@@ -42,6 +44,7 @@ _SKIP_ANN = {
 }
 
 _WIN_WORDS = re.compile(r"Win|Won|Victory|Team1Won|Team2Won", re.I)
+_SUBTYPE = re.compile(r"(?:SubType_|subtype_)?", re.I)
 
 
 def open_folder(path: Path) -> None:
@@ -89,6 +92,32 @@ def _ann_details(ann: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _is_token(go: Dict[str, Any]) -> bool:
+    types = go.get("cardTypes") or go.get("cardType") or []
+    if isinstance(types, str):
+        types = [types]
+    return any("Token" in str(t) for t in types)
+
+
+def _pt(go: Dict[str, Any]) -> str:
+    p, t = go.get("power"), go.get("toughness")
+    if p is None or t is None:
+        return ""
+    return f"{p}/{t}"
+
+
+def _subtype_words(go: Dict[str, Any]) -> List[str]:
+    raw = go.get("subtypes") or go.get("subtype") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    out = []
+    for s in raw:
+        word = re.sub(r"^(SubType_|subtype_)", "", str(s), flags=re.I).replace("_", " ").strip()
+        if word:
+            out.append(word.title())
+    return out
+
+
 class MatchRecap:
     """Write a public-info text recap of the current match."""
 
@@ -103,11 +132,20 @@ class MatchRecap:
         self._game_no = 0
         self._seen_ann: Set[int] = set()
         self._turn_key: Optional[Tuple[int, int]] = None
+        self._turn_num: Optional[int] = None
         self._phase = ""
         self._life: Dict[int, int] = {}
         self._attacking: Set[int] = set()
+        self._blocking: Dict[int, int] = {}
         self._header_written = False
         self._game_open = False
+        self._final = False
+        self._stack_seen: Set[int] = set()
+        self._logged_cast: Set[int] = set()
+        self._bf: Dict[int, Tuple[str, Optional[int]]] = {}
+        self._mull: Dict[int, int] = {}
+        self._kept: Set[int] = set()
+        self._last_affector: str = ""
 
     def set_players(self, seat_names: Dict[int, str], match_id: str = "") -> None:
         if match_id and match_id != self._match_id and self.path:
@@ -119,16 +157,52 @@ class MatchRecap:
 
     def close_match(self, reason: str = "Match ended") -> None:
         if self._game_open:
+            self._dump_board(f"Board at {reason.lower()}")
             self._line(f"--- {reason} ---")
             self._game_open = False
+        self._final = True
+        self._maybe_rename()
         self.path = None
         self._started = None
         self._seen_ann.clear()
         self._turn_key = None
+        self._turn_num = None
         self._phase = ""
         self._life.clear()
         self._attacking.clear()
+        self._blocking.clear()
         self._header_written = False
+        self._final = False
+        self._stack_seen.clear()
+        self._logged_cast.clear()
+        self._bf.clear()
+        self._mull.clear()
+        self._kept.clear()
+        self._last_affector = ""
+
+    def note_mulligan(self, seat: Optional[int], decision: str, count: Optional[int] = None) -> None:
+        self._ensure_file()
+        who = self._who(seat)
+        low = (decision or "").lower()
+        if "accept" in low or "keep" in low:
+            self._kept.add(int(seat) if seat is not None else -1)
+            extra = f" ({count} cards)" if count else ""
+            self._line(f"  {who} keeps{extra}")
+        elif "mull" in low:
+            n = count if count is not None else self._mull.get(int(seat) if seat is not None else -1, 0) + 1
+            if seat is not None:
+                self._mull[int(seat)] = int(n)
+            self._line(f"  {who} mulligans to {max(0, 7 - int(n))}")
+        else:
+            self._line(f"  {who} mulligan: {decision}")
+
+    def note_player_mulligan_count(self, seat: int, count: int, hand_size: Optional[int] = None) -> None:
+        prev = self._mull.get(int(seat), 0)
+        if count > prev:
+            self._mull[int(seat)] = count
+            self._ensure_file()
+            left = hand_size if hand_size is not None else max(0, 7 - int(count))
+            self._line(f"  {self._who(seat)} mulligans to {left}")
 
     def consume(self, gsm: Dict[str, Any]) -> None:
         """Caller holds state.lock."""
@@ -156,18 +230,13 @@ class MatchRecap:
             self._ensure_file()
             self._line(f"========== Game {self._game_no} ==========")
             self._game_open = True
-            self._turn_key = None
-            self._phase = ""
-            self._life.clear()
-            self._attacking.clear()
+            self._reset_game_trackers()
         elif starting and game_no and self._game_no and game_no != self._game_no:
+            self._dump_board(f"End of game {self._game_no}")
             self._line("")
             self._game_no = game_no
             self._line(f"========== Game {self._game_no} ==========")
-            self._turn_key = None
-            self._phase = ""
-            self._life.clear()
-            self._attacking.clear()
+            self._reset_game_trackers()
             self._game_open = True
 
         if not self.path and not starting and not over:
@@ -175,36 +244,57 @@ class MatchRecap:
         if starting or over or self._game_open:
             self._ensure_file()
 
+        self._mulligan_from_players(gsm.get("players") or info.get("players") or [])
+
         turn = gsm.get("turnInfo") or {}
         tnum = turn.get("turnNumber")
         active = turn.get("activePlayer") or turn.get("decisionPlayer")
-        if tnum is not None:
-            try:
-                tnum = int(tnum)
-            except Exception:
-                tnum = None
-        if active is not None:
-            try:
-                active = int(active)
-            except Exception:
-                active = None
+        try:
+            tnum = int(tnum) if tnum is not None else None
+        except Exception:
+            tnum = None
+        try:
+            active = int(active) if active is not None else None
+        except Exception:
+            active = None
+        phase = str(turn.get("phase") or "").replace("Phase_", "")
+        step = str(turn.get("step") or "").replace("Step_", "")
+
         if tnum is not None and active is not None:
             key = (tnum, active)
             if key != self._turn_key:
+                if self._turn_key is not None:
+                    prev_turn = self._turn_key[0]
+                    self._dump_board(f"End of turn {prev_turn}")
                 self._turn_key = key
+                self._turn_num = tnum
                 self._line("")
                 self._line(f"Turn {tnum} — {self._who(active)}")
-        phase = str(turn.get("phase") or "").replace("Phase_", "")
+                self._stack_seen.clear()
         if phase and phase != self._phase:
+            prev = self._phase
             self._phase = phase
-            if phase.lower() in ("combat", "combatphase", "beginningofcombat"):
-                self._line("  — Combat —")
+            plow = phase.lower()
+            slow = step.lower()
+            if plow in ("combat", "combatphase") or slow in (
+                "declareattackers",
+                "declareblockers",
+                "combatdamage",
+            ):
+                if "combat" not in prev.lower() or prev.lower() in ("precombatmain",):
+                    self._line("  — Combat —")
+            if plow in ("ending", "end", "endingphase") or slow in ("end", "cleanup", "endofturn"):
+                self._dump_board(f"End of turn {self._turn_num or '?'}")
 
         self._life_lines(gsm.get("players") or info.get("players") or [])
         self._annotations(gsm.get("annotations") or [])
+        self._stack_casts()
         self._attacks(gsm.get("gameObjects") or [])
+        self._blocks(gsm.get("gameObjects") or [])
+        self._battlefield_diff()
 
         if over and self._game_open:
+            self._dump_board("Final board")
             winner = self._winner_text(info, gsm)
             self._line(f"========== Game {self._game_no or '?'} over ==========")
             if winner:
@@ -213,6 +303,30 @@ class MatchRecap:
                 bits = [f"{self._who(s)} {hp}" for s, hp in sorted(self._life.items())]
                 self._line("  Life: " + ", ".join(bits))
             self._game_open = False
+            self._final = True
+            self._maybe_rename()
+
+    def _reset_game_trackers(self) -> None:
+        self._turn_key = None
+        self._turn_num = None
+        self._phase = ""
+        self._life.clear()
+        self._attacking.clear()
+        self._blocking.clear()
+        self._stack_seen.clear()
+        self._logged_cast.clear()
+        self._bf.clear()
+        self._mull.clear()
+        self._kept.clear()
+        self._last_affector = ""
+
+    def _desired_name(self) -> str:
+        seats = dict(getattr(self.state, "seat_names", {}) or {})
+        n1 = _safe_name(seats.get(1) or "", "Seat 1")
+        n2 = _safe_name(seats.get(2) or "", "Seat 2")
+        ts = (self._started or _dt.datetime.now()).strftime("%Y-%m-%d %H%M")
+        tag = " FINAL" if self._final else ""
+        return f"{n1} vs {n2} {ts}{tag}.txt"
 
     def _ensure_file(self) -> None:
         if self.path:
@@ -224,7 +338,8 @@ class MatchRecap:
         path = self.match_dir / name
         n = 2
         while path.exists():
-            path = self.match_dir / name.replace(".txt", f"-{n}.txt")
+            stem = name[:-4] if name.endswith(".txt") else name
+            path = self.match_dir / f"{stem}-{n}.txt"
             n += 1
         self.path = path
         try:
@@ -232,13 +347,6 @@ class MatchRecap:
         except Exception:
             pass
         self._write_header()
-
-    def _desired_name(self) -> str:
-        seats = dict(getattr(self.state, "seat_names", {}) or {})
-        n1 = _safe_name(seats.get(1) or "", "Seat 1")
-        n2 = _safe_name(seats.get(2) or "", "Seat 2")
-        ts = (self._started or _dt.datetime.now()).strftime("%Y-%m-%d %H%M")
-        return f"{n1} vs {n2} {ts}.txt"
 
     def _maybe_rename(self) -> None:
         if not self.path or not self.path.exists():
@@ -262,10 +370,9 @@ class MatchRecap:
         if self._header_written:
             return
         seats = dict(getattr(self.state, "seat_names", {}) or {})
-        you = seats.get(self.state.local_seat or 0) or "You"
         started = (self._started or _dt.datetime.now()).strftime("%Y-%m-%d %H:%M:%S")
         lines = [
-            "MTGA Deck Overlay — match recap (public information only)",
+            "MTGA Deck Overlay — match recap (public information, verbose)",
             f"Started: {started}",
         ]
         if self._match_id:
@@ -279,7 +386,8 @@ class MatchRecap:
                 extra = "  (you)"
             lines.append(f"Seat {seat}: {label}{extra}")
         lines.append("")
-        lines.append("Hidden zones (hand / library) are omitted. Card names appear once they become public.")
+        lines.append("Includes casts, combat, end-of-turn boards, and cards leaving play.")
+        lines.append("Hidden zones (hand / library) stay unnamed for the opponent.")
         lines.append("")
         self._raw("\n".join(lines) + "\n")
         self._header_written = True
@@ -307,6 +415,57 @@ class MatchRecap:
         z = self.state.zones.get(zid) or {}
         return str(z.get("type") or "")
 
+    def _pretty_from_grp(self, grp: Any) -> Optional[str]:
+        if grp is None:
+            return None
+        try:
+            gid = int(grp)
+        except Exception:
+            return None
+        pretty = self.names.get(gid)
+        if pretty and not _looks_like_placeholder(pretty, gid):
+            return pretty
+        loc = self.names.resolve_loc(gid)
+        if loc and not _looks_like_placeholder(loc, gid):
+            return loc
+        return None
+
+    def _describe_go(self, go: Dict[str, Any], grp: Optional[int]) -> str:
+        pretty = self._pretty_from_grp(grp)
+        if pretty:
+            return pretty
+        loc = go.get("name")
+        if loc is not None and not isinstance(loc, str):
+            hit = self.names.resolve_loc(loc)
+            if hit and not _looks_like_placeholder(hit):
+                if grp is not None:
+                    try:
+                        self.names.remember(int(grp), hit)
+                    except Exception:
+                        pass
+                return hit
+        for key in ("title", "cardName", "englishName"):
+            val = go.get(key)
+            if isinstance(val, str) and not _looks_like_placeholder(val, grp):
+                return val
+        bits = []
+        pt = _pt(go)
+        if pt:
+            bits.append(pt)
+        subs = _subtype_words(go)
+        if subs:
+            bits.append(" ".join(subs))
+        if _is_token(go):
+            bits.append("token")
+        if bits:
+            label = " ".join(bits)
+            if grp:
+                return f"{label} (#{int(grp)})"
+            return label
+        if grp:
+            return f"#{int(grp)}"
+        return "a card"
+
     def _card_name(self, iid: Any, allow_hidden: bool) -> Tuple[str, Optional[int], Optional[int]]:
         try:
             iid = int(iid)
@@ -314,35 +473,56 @@ class MatchRecap:
             return ("a card", None, None)
         go = self.state.objects.get(iid) or {}
         grp = go.get("grpId")
+        try:
+            grp_i = int(grp) if grp is not None else None
+        except Exception:
+            grp_i = None
         seat = go.get("controllerSeatId") or go.get("ownerSeatId")
         try:
             seat_i = int(seat) if seat is not None else None
         except Exception:
             seat_i = None
-        zid = go.get("zoneId")
-        ztype = self._zone_type(zid)
+        ztype = self._zone_type(go.get("zoneId"))
         hidden = ztype in _HIDDEN_ZONES
         is_ours = (
             self.state.local_seat is not None
             and seat_i is not None
             and int(seat_i) == int(self.state.local_seat)
         )
-        if hidden and not (allow_hidden and is_ours):
-            return ("a card", seat_i, int(grp) if grp else None)
-        pretty = None
-        if grp is not None:
-            pretty = self.names.get(int(grp))
-        if _looks_like_placeholder(pretty, int(grp) if grp else None):
-            pretty = None
-        if not pretty:
-            loc = go.get("name")
-            if loc is not None and not isinstance(loc, str):
-                pretty = self.names.resolve_loc(loc)
-        if pretty and not _looks_like_placeholder(pretty):
-            return (pretty, seat_i, int(grp) if grp else None)
-        if grp and not hidden:
-            return (f"#{int(grp)}", seat_i, int(grp))
-        return ("a card", seat_i, int(grp) if grp else None)
+        if hidden and not (allow_hidden and is_ours) and not (ztype in _PUBLIC_ZONES):
+            return ("a card", seat_i, grp_i)
+        return (self._describe_go(go, grp_i), seat_i, grp_i)
+
+    def _mulligan_from_players(self, players: Any) -> None:
+        if not isinstance(players, list):
+            return
+        for p in players:
+            if not isinstance(p, dict):
+                continue
+            seat = p.get("systemSeatNumber") or p.get("systemSeatId") or p.get("seatId")
+            if seat is None:
+                continue
+            try:
+                seat_i = int(seat)
+            except Exception:
+                continue
+            mc = p.get("mulliganCount")
+            if mc is None:
+                continue
+            try:
+                mc = int(mc)
+            except Exception:
+                continue
+            pending = str(p.get("pendingMessageType") or "")
+            if mc and mc != self._mull.get(seat_i, 0):
+                self.note_player_mulligan_count(seat_i, mc)
+            if "Mulligan" in pending:
+                continue
+            if self._game_open and seat_i not in self._kept and self._turn_num == 1 and mc == self._mull.get(seat_i, 0):
+                # First main-phase sighting after mulligans settle.
+                if self._phase and "main" in self._phase.lower() and seat_i not in self._kept:
+                    self._kept.add(seat_i)
+                    self._line(f"  {self._who(seat_i)} keeps")
 
     def _life_lines(self, players: Any) -> None:
         if not isinstance(players, list):
@@ -386,11 +566,10 @@ class MatchRecap:
                     if len(self._seen_ann) > 4000:
                         self._seen_ann = set(list(self._seen_ann)[-2000:])
             types = _ann_types(ann)
-            if any(t in _SKIP_ANN for t in types) and not any("ZoneTransfer" in t for t in types):
-                if any("Damage" in t or "Attack" in t or "Revealed" in t for t in types):
-                    pass
-                else:
-                    continue
+            if any(t in _SKIP_ANN for t in types) and not any(
+                k in "".join(types) for k in ("ZoneTransfer", "Damage", "Attack", "Block", "Reveal", "Resolution")
+            ):
+                continue
             details = _ann_details(ann)
             affector = ann.get("affectorId")
             affected = ann.get("affectedIds") or []
@@ -403,17 +582,29 @@ class MatchRecap:
             if any("Damage" in t for t in types):
                 amt = details.get("damage") or details.get("Damage") or details.get("amount")
                 src, src_seat, _ = self._card_name(affector, allow_hidden=False)
-                tgt = affected[0] if affected else None
-                tgt_name, tgt_seat, _ = self._card_name(tgt, allow_hidden=False) if tgt else ("", None, None)
-                who = self._who(src_seat) if src_seat is not None else src
+                tgt_bits = []
+                for tgt in affected:
+                    tgt_name, tgt_seat, _ = self._card_name(tgt, allow_hidden=False)
+                    if tgt_name == "a card" and tgt_seat is None:
+                        try:
+                            maybe_seat = int(tgt)
+                        except Exception:
+                            maybe_seat = None
+                        if maybe_seat in (1, 2):
+                            tgt_bits.append(self._who(maybe_seat))
+                            continue
+                    if tgt_name and tgt_name != "a card":
+                        tgt_bits.append(tgt_name)
+                    elif tgt_seat is not None:
+                        tgt_bits.append(self._who(tgt_seat))
                 if amt is not None:
-                    extra = f" to {tgt_name}" if tgt_name and tgt_name != "a card" else ""
+                    extra = (" to " + ", ".join(tgt_bits)) if tgt_bits else ""
                     self._line(f"  {src} deals {amt} damage{extra}")
                 continue
             if any("CardRevealed" in t or "Revealed" in t for t in types):
                 names = []
                 for iid in ([affector] if affector is not None else []) + list(affected):
-                    nm, seat, _ = self._card_name(iid, allow_hidden=True)
+                    nm, _, _ = self._card_name(iid, allow_hidden=True)
                     if nm != "a card":
                         names.append(nm)
                 if names:
@@ -427,6 +618,27 @@ class MatchRecap:
                         names.append(nm)
                 if names:
                     self._line("  Attackers: " + ", ".join(names))
+                continue
+            if any("DeclaredBlocker" in t or "Blocker" in t for t in types):
+                blk, _, _ = self._card_name(affector if affector is not None else (affected[0] if affected else None), False)
+                atk_ids = affected if affector is not None else []
+                atk_names = []
+                for iid in atk_ids:
+                    nm, _, _ = self._card_name(iid, False)
+                    if nm != "a card":
+                        atk_names.append(nm)
+                if blk != "a card":
+                    if atk_names:
+                        self._line(f"  {blk} blocks {', '.join(atk_names)}")
+                    else:
+                        self._line(f"  {blk} blocks")
+                continue
+            if any("ResolutionStart" in t or "ResolutionComplete" in t for t in types):
+                nm, seat, _ = self._card_name(affector, allow_hidden=False)
+                if nm != "a card" and "Start" in "".join(types):
+                    if affector not in self._logged_cast:
+                        who = self._who(seat)
+                        self._line(f"  {who} resolves {nm}")
 
     def _zone_transfer(self, details: Dict[str, Any], affector: Any, affected: List[Any]) -> None:
         cat = str(details.get("category") or details.get("Category") or "")
@@ -439,23 +651,46 @@ class MatchRecap:
             return
         public_dest = dest_t in _PUBLIC_ZONES or dest_t == "ZoneType_Stack"
         allow_hidden = cat in ("Draw", "Discard", "Mulligan")
+        cause = ""
+        if affector is not None:
+            cname, _, _ = self._card_name(affector, allow_hidden=False)
+            if cname and cname != "a card" and affector not in iids:
+                cause = cname
+                self._last_affector = cname
+        dest_label = dest_t.replace("ZoneType_", "") or "unknown"
         for iid in iids:
-            # Our own draws may name the card; opponent draws stay "a card".
             nm, seat, _ = self._card_name(iid, allow_hidden=allow_hidden)
             who = self._who(seat)
-            if cat == "CastSpell":
+            if cat == "CastSpell" or (dest_t == "ZoneType_Stack" and cat in ("", "Cast", "Play")):
                 self._line(f"  {who} casts {nm}")
+                try:
+                    self._logged_cast.add(int(iid))
+                except Exception:
+                    pass
             elif cat == "PlayLand":
                 self._line(f"  {who} plays {nm}")
             elif cat == "Draw":
                 self._line(f"  {who} draws {nm}")
             elif cat == "Discard":
                 self._line(f"  {who} discards {nm}")
-            elif cat == "Mill" or (src_t == "ZoneType_Library" and dest_t == "ZoneType_Graveyard"):
-                if cat and cat != "Resolve":
-                    self._line(f"  {who} mills {nm}")
+            elif cat == "Mulligan":
+                self._line(f"  {who} mulligan-sends {nm}")
+            elif cat == "Mill" or (src_t == "ZoneType_Library" and dest_t == "ZoneType_Graveyard" and cat != "Resolve"):
+                self._line(f"  {who} mills {nm}")
+            elif src_t == "ZoneType_Battlefield" and dest_t != "ZoneType_Battlefield":
+                why = f" ({cause})" if cause else (f" ({cat})" if cat else "")
+                verb = {
+                    "ZoneType_Exile": "exiled",
+                    "ZoneType_Graveyard": "dies",
+                    "ZoneType_Hand": "bounced to hand",
+                    "ZoneType_Library": "leaves play → library",
+                    "ZoneType_Stack": "flickered onto stack",
+                    "ZoneType_Command": "leaves play → command",
+                }.get(dest_t, f"leaves play → {dest_label}")
+                self._line(f"  {nm} {verb}{why}")
             elif cat in ("Exile", "ExileFromPlay", "ExileFromHand"):
-                self._line(f"  {nm} is exiled")
+                why = f" ({cause})" if cause else ""
+                self._line(f"  {nm} is exiled{why}")
             elif cat in ("Countered", "CounterSpell"):
                 self._line(f"  {nm} is countered")
             elif cat == "Resolve":
@@ -466,18 +701,41 @@ class MatchRecap:
                     self._line(f"  {nm} enters the battlefield")
             elif public_dest and nm != "a card" and dest_t == "ZoneType_Stack":
                 self._line(f"  {who} puts {nm} on the stack")
-            elif public_dest and nm != "a card" and dest_t == "ZoneType_Graveyard" and src_t == "ZoneType_Battlefield":
-                self._line(f"  {nm} dies")
+                try:
+                    self._logged_cast.add(int(iid))
+                except Exception:
+                    pass
             elif public_dest and nm != "a card" and cat:
                 pretty_cat = re.sub(r"([a-z])([A-Z])", r"\1 \2", cat).lower()
-                self._line(f"  {nm}: {pretty_cat}")
+                why = f" ({cause})" if cause else ""
+                self._line(f"  {nm}: {pretty_cat}{why}")
+
+    def _stack_casts(self) -> None:
+        now: Set[int] = set()
+        for z in self.state.zones.values():
+            if str(z.get("type") or "") != "ZoneType_Stack":
+                continue
+            for iid in z.get("objectInstanceIds") or []:
+                try:
+                    now.add(int(iid))
+                except Exception:
+                    continue
+        for iid in now - self._stack_seen:
+            if iid in self._logged_cast:
+                continue
+            nm, seat, _ = self._card_name(iid, allow_hidden=False)
+            if nm == "a card":
+                continue
+            self._line(f"  {self._who(seat)} casts {nm}")
+            self._logged_cast.add(iid)
+        self._stack_seen = now
 
     def _attacks(self, objs: Any) -> None:
         if not isinstance(objs, list):
-            return
+            objs = list(self.state.objects.values())
         now: Set[int] = set()
         names = []
-        for go in objs:
+        for go in objs if isinstance(objs, list) else []:
             if not isinstance(go, dict):
                 continue
             if not go.get("attacking"):
@@ -494,12 +752,135 @@ class MatchRecap:
                 nm, _, _ = self._card_name(iid, allow_hidden=False)
                 if nm != "a card":
                     names.append(nm)
+        if not now:
+            for iid, go in self.state.objects.items():
+                if go.get("attacking"):
+                    now.add(int(iid))
+                    if int(iid) not in self._attacking:
+                        nm, _, _ = self._card_name(iid, False)
+                        if nm != "a card":
+                            names.append(nm)
         if names:
             self._line("  Attacks: " + ", ".join(names))
         if now:
             self._attacking = now
-        elif self._phase.lower().startswith("combat") is False:
+        elif "combat" not in self._phase.lower():
             self._attacking.clear()
+
+    def _blocks(self, objs: Any) -> None:
+        pairs = []
+        seen = {}
+        pool = []
+        if isinstance(objs, list):
+            pool.extend(objs)
+        pool.extend(self.state.objects.values())
+        for go in pool:
+            if not isinstance(go, dict):
+                continue
+            iid = go.get("instanceId")
+            if iid is None:
+                continue
+            try:
+                iid = int(iid)
+            except Exception:
+                continue
+            blockers = (
+                go.get("blockingCreatureInstanceIds")
+                or go.get("blockers")
+                or go.get("blockedByInstanceIds")
+                or []
+            )
+            if isinstance(blockers, int):
+                blockers = [blockers]
+            if go.get("blocking") and not blockers:
+                # this object is a blocker; attacker id may be in "attacker" fields
+                atk = go.get("attackerInstanceId") or go.get("attackingInstanceId") or go.get("blockingAttackerInstanceId")
+                if atk is not None:
+                    blockers = []
+                    blk_id = iid
+                    atk_id = int(atk)
+                    key = (blk_id, atk_id)
+                    if key not in self._blocking:
+                        self._blocking[blk_id] = atk_id
+                        pairs.append((blk_id, atk_id))
+                    continue
+            if blockers:
+                for b in blockers:
+                    try:
+                        b = int(b)
+                    except Exception:
+                        continue
+                    key = (b, iid)
+                    if self._blocking.get(b) == iid:
+                        continue
+                    self._blocking[b] = iid
+                    pairs.append((b, iid))
+        for blk, atk in pairs:
+            bn, _, _ = self._card_name(blk, False)
+            an, _, _ = self._card_name(atk, False)
+            if bn != "a card" or an != "a card":
+                self._line(f"  {bn} blocks {an}")
+
+    def _battlefield_now(self) -> Dict[int, Tuple[str, Optional[int]]]:
+        out: Dict[int, Tuple[str, Optional[int]]] = {}
+        bf_ids = set()
+        for z in self.state.zones.values():
+            if str(z.get("type") or "") != "ZoneType_Battlefield":
+                continue
+            for iid in z.get("objectInstanceIds") or []:
+                try:
+                    bf_ids.add(int(iid))
+                except Exception:
+                    pass
+        for iid, go in self.state.objects.items():
+            ztype = self._zone_type(go.get("zoneId"))
+            if ztype != "ZoneType_Battlefield" and int(iid) not in bf_ids:
+                continue
+            nm, seat, _ = self._card_name(iid, False)
+            out[int(iid)] = (nm, seat)
+        return out
+
+    def _battlefield_diff(self) -> None:
+        now = self._battlefield_now()
+        if not self._bf:
+            self._bf = now
+            return
+        left = set(self._bf) - set(now)
+        for iid in sorted(left):
+            nm, seat = self._bf[iid]
+            go = self.state.objects.get(iid) or {}
+            dest = self._zone_type(go.get("zoneId")) or "gone"
+            dest_label = dest.replace("ZoneType_", "") or "gone"
+            if dest == "ZoneType_Battlefield":
+                continue
+            why = f" ({self._last_affector})" if self._last_affector else ""
+            if nm == "a card":
+                continue
+            # Zone-transfer line usually already covered this.
+            if dest in ("ZoneType_Exile", "ZoneType_Graveyard", "ZoneType_Hand", "ZoneType_Library"):
+                continue
+            self._line(f"  {nm} leaves battlefield → {dest_label}{why}")
+        self._bf = now
+
+    def _dump_board(self, title: str) -> None:
+        now = self._battlefield_now()
+        self._bf = now
+        if not now:
+            return
+        by_seat: Dict[int, List[str]] = {}
+        for iid, (nm, seat) in now.items():
+            if nm == "a card":
+                continue
+            go = self.state.objects.get(iid) or {}
+            pt = _pt(go)
+            label = nm + (f" {pt}" if pt and pt not in nm else "")
+            by_seat.setdefault(int(seat) if seat is not None else 0, []).append(label)
+        if not by_seat:
+            return
+        self._line(f"  [{title}]")
+        for seat in sorted(by_seat):
+            cards = ", ".join(sorted(by_seat[seat]))
+            self._line(f"    {self._who(seat) if seat else 'Unknown'}: {cards}")
 
     def _winner_text(self, info: Dict[str, Any], gsm: Dict[str, Any]) -> str:
         win = (

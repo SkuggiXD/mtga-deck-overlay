@@ -185,6 +185,7 @@ def launch_ui(state: OverlayState, names: CardNames) -> None:
     status_lbl.pack(fill="x", padx=10, pady=(4, 0))
 
     meta = MetaEngine()
+    meta.warm()
 
     totals = tk.Label(root, text="—", bg=BG, fg=FG, font=("Segoe UI", 11, "bold"), anchor="w")
     totals.pack(fill="x", padx=10, pady=(2, 4))
@@ -325,7 +326,7 @@ def launch_ui(state: OverlayState, names: CardNames) -> None:
     def open_obs_folder() -> None:
         OBS_DIR.mkdir(exist_ok=True)
         # Touch files so the folder isn't empty on first click.
-        for name in ("playerdeck.html", "oppdeck.html", "you.txt", "opp.txt"):
+        for name in ("playerdeck.html", "oppdeck.html", "playerdeck_data.js", "oppdeck_data.js", "you.txt", "opp.txt"):
             p = OBS_DIR / name
             if not p.exists():
                 p.write_text("", encoding="utf-8")

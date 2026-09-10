@@ -33,7 +33,9 @@ While the app is running it writes:
 `%LOCALAPPDATA%\\MTGADeckOverlay\\obs\\playerdeck.html`  
 `%LOCALAPPDATA%\\MTGADeckOverlay\\obs\\oppdeck.html`
 
-Add those as Browser Sources at **480 × 1080**. Closing the app blanks the pages.
+Add those as Browser Sources at **480 × 1080**. Leave **Refresh browser when scene becomes active** off — the page updates in place and a full reload is what made the overlay blink.
+
+Closing the app blanks the card lists.
 
 ## Match recaps
 

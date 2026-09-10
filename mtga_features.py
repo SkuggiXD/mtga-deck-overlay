@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 import os
 import re
 import sys
@@ -9,6 +10,7 @@ import threading
 import time
 import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -195,8 +197,9 @@ def _collect_archetypes(fmt: str) -> List[Tuple[str, Optional[str], Optional[str
 
 
 class MetaEngine:
-    MIN_CARDS = 3
-    MAX_DECKS = 24
+    MIN_CARDS = 4
+    MAX_DECKS = 36
+    CACHE_VER = "v4"
 
     def __init__(self) -> None:
         self.format = "standard"
@@ -211,8 +214,13 @@ class MetaEngine:
         self.status = "Meta idle"
         self.prediction: Optional[Dict[str, Any]] = None
         self._lock = threading.Lock()
-        self._last_key: Optional[Tuple[str, Tuple[str, ...]]] = None
+        self._last_key: Optional[Tuple[Any, ...]] = None
         self._loading = False
+        self._pending: Optional[Tuple[Any, List[str], List[str]]] = None
+        self._idf: Dict[str, float] = {}
+        self._df: Dict[str, int] = {}
+        self._sticky_name = ""
+        self._fetch_lock = threading.Lock()
 
     def set_format(self, fmt: str) -> None:
         if fmt == self.format:
@@ -226,7 +234,15 @@ class MetaEngine:
             self.decks = []
             self.prediction = None
             self._last_key = None
+            self._idf = {}
+            self._df = {}
+            self._sticky_name = ""
         self.status = f"Format → {fmt}"
+        self.warm()
+
+    def warm(self) -> None:
+        """Prefetch the format cache so the first opponent cards rank instantly."""
+        threading.Thread(target=self._ensure_decks, daemon=True).start()
 
     def consider(self, seen_names: List[str], gy_names: Optional[List[str]] = None) -> None:
         unique = []
@@ -250,7 +266,10 @@ class MetaEngine:
             return
         key = (self.format, tuple(sorted(unique)), tuple(sorted(gy)))
         with self._lock:
-            if key == self._last_key or self._loading:
+            if key == self._last_key:
+                return
+            if self._loading:
+                self._pending = (key, unique, gy)
                 return
             self._loading = True
         threading.Thread(target=self._run, args=(key, unique, gy), daemon=True).start()
@@ -268,28 +287,59 @@ class MetaEngine:
         try:
             self._ensure_decks()
             ranked = self._rank(unique, gy)
+            confident = [
+                r for r in ranked
+                if r["hits"] >= 2 and (r["score"] >= 0.22 or r.get("rare", 0) >= 1)
+            ]
+            shown = confident[:3] if confident else []
             with self._lock:
-                self.prediction = {
-                    "seen": unique,
-                    "matches": ranked[:3],
-                }
-                self._last_key = key
-                if ranked:
-                    top = ranked[0]
+                if shown:
+                    top = shown[0]
+                    prev = self._sticky_name
+                    if prev and prev != top["name"] and ranked:
+                        old = next((r for r in ranked if r["name"] == prev), None)
+                        if old and (top["score"] - old["score"]) < 0.08 and top["hits"] <= old["hits"]:
+                            shown = [old] + [r for r in shown if r["name"] != prev][:2]
+                            top = shown[0]
+                    self._sticky_name = top["name"]
                     self.status = f"{top['name']}  {top['hits']}/{top['need']}"
                 else:
-                    self.status = f"No overlap in {len(self.decks)} lists yet"
+                    self._sticky_name = ""
+                    n = len(self.decks)
+                    self.status = (
+                        f"Need a fingerprint ({len(unique)} cards, {n} lists)"
+                        if unique
+                        else f"No overlap in {n} lists yet"
+                    )
+                self.prediction = {
+                    "seen": unique,
+                    "matches": shown,
+                }
+                self._last_key = key
         except Exception as exc:
             with self._lock:
                 self.status = f"Meta error: {exc}"
         finally:
+            nxt = None
             with self._lock:
                 self._loading = False
+                if self._pending and self._pending[0] != key:
+                    nxt = self._pending
+                self._pending = None
+            if nxt:
+                nkey, nunique, ngy = nxt
+                with self._lock:
+                    self._loading = True
+                self._run(nkey, nunique, ngy)
 
     def _cache_path(self) -> Path:
-        return CACHE_DIR / f"meta_{self.format}_v3.json"
+        return CACHE_DIR / f"meta_{self.format}_{self.CACHE_VER}.json"
 
     def _ensure_decks(self) -> None:
+        with self._fetch_lock:
+            self._ensure_decks_locked()
+
+    def _ensure_decks_locked(self) -> None:
         with self._lock:
             if self.decks:
                 return
@@ -301,6 +351,7 @@ class MetaEngine:
                 if decks:
                     with self._lock:
                         self.decks = decks
+                        self._rebuild_weights(decks)
                         self.status = f"Meta cache ({len(decks)} {self.format} lists)"
                     return
             except Exception:
@@ -315,40 +366,60 @@ class MetaEngine:
                 pass
         with self._lock:
             self.decks = decks
+            self._rebuild_weights(decks)
             self.status = f"Loaded {len(decks)} {self.format} lists"
+
+    def _rebuild_weights(self, decks: List[Dict[str, Any]]) -> None:
+        n = max(1, len(decks))
+        df: Counter = Counter()
+        for d in decks:
+            names = {_norm_card(c) for c in (d.get("cards") or {}) if _norm_card(c)}
+            df.update(names)
+        self._df = dict(df)
+        self._idf = {c: math.log((n + 1) / (df[c] + 1)) + 1.0 for c in df}
+
+    def _download_one(self, name: str, slug: Optional[str], did: Optional[str]) -> Optional[Dict[str, Any]]:
+        url = (
+            f"https://www.mtggoldfish.com/archetype/{slug}"
+            if slug
+            else f"https://www.mtggoldfish.com/deck/{did}"
+        )
+        try:
+            if slug and not did:
+                arch_html = _fetch_goldfish(url, timeout=12)
+                did = _featured_deck_id(arch_html)
+            if not did:
+                return None
+            text = _fetch_goldfish(f"https://www.mtggoldfish.com/deck/download/{did}", timeout=12)
+            cards = parse_simple_decklist(text)
+            if sum(cards.values()) < 20:
+                return None
+            return {
+                "name": name,
+                "id": did,
+                "slug": slug or "",
+                "url": url,
+                "cards": dict(cards),
+            }
+        except Exception:
+            return None
 
     def _download_meta(self) -> List[Dict[str, Any]]:
         rows = _collect_archetypes(self.format)[: self.MAX_DECKS]
         decks: List[Dict[str, Any]] = []
-        for name, slug, did in rows:
-            try:
-                url = (
-                    f"https://www.mtggoldfish.com/archetype/{slug}"
-                    if slug
-                    else f"https://www.mtggoldfish.com/deck/{did}"
-                )
-                if slug and not did:
-                    arch_html = _fetch_goldfish(url)
-                    did = _featured_deck_id(arch_html)
-                    time.sleep(0.12)
-                if not did:
-                    continue
-                text = _fetch_goldfish(f"https://www.mtggoldfish.com/deck/download/{did}", timeout=15)
-                cards = parse_simple_decklist(text)
-                if sum(cards.values()) < 20:
-                    continue
-                decks.append(
-                    {
-                        "name": name,
-                        "id": did,
-                        "slug": slug or "",
-                        "url": url,
-                        "cards": dict(cards),
-                    }
-                )
-                time.sleep(0.15)
-            except Exception:
-                continue
+        if not rows:
+            return decks
+        workers = min(8, max(2, len(rows)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futs = [pool.submit(self._download_one, n, s, d) for n, s, d in rows]
+            for fut in as_completed(futs):
+                try:
+                    deck = fut.result()
+                except Exception:
+                    deck = None
+                if deck:
+                    decks.append(deck)
+        decks.sort(key=lambda d: str(d.get("name") or ""))
         return decks
 
     def _rank(self, unique: List[str], gy: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -362,18 +433,33 @@ class MetaEngine:
             cards = d.get("cards") or {}
             main = {_norm_card(n) for n in cards if _norm_card(n)}
             hit_keys = want & main
-            hits = sorted(want_map[k] for k in hit_keys)
-            miss = sorted(want_map[k] for k in (want - main))
-            need = len(want)
-            score = (len(hit_keys) / need) if need else 0.0
-            gy_hits = len(gy_set & main)
-            if gy_set:
-                score += 0.18 * (gy_hits / max(1, len(gy_set)))
             if not hit_keys:
                 continue
+            hits = sorted(want_map[k] for k in hit_keys)
+            miss_keys = want - main
+            miss = sorted(want_map[k] for k in miss_keys)
+            need = len(want)
+            idf = self._idf
+            df = self._df
+            hit_w = sum(idf.get(k, 1.0) for k in hit_keys)
+            want_w = sum(idf.get(k, 1.0) for k in want) or 1.0
+            miss_w = sum(idf.get(k, 1.0) for k in miss_keys)
+            score = hit_w / want_w
+            score -= 0.28 * (miss_w / want_w)
+            rare_hits = sum(1 for k in hit_keys if df.get(k, 99) <= max(2, len(decks) // 8))
+            score += 0.10 * rare_hits
+            gy_hits = len(gy_set & main)
+            if gy_set:
+                score += 0.12 * (gy_hits / max(1, len(gy_set)))
+            score = max(0.0, min(1.0, score))
             extras = []
-            for nm, qty in sorted(cards.items(), key=lambda kv: (-kv[1], kv[0])):
-                if _norm_card(nm) in want or nm in BASIC_LANDS:
+            def extra_key(kv):
+                nm, qty = kv
+                nk = _norm_card(nm)
+                return (-idf.get(nk, 0.0), -qty, nm)
+            for nm, qty in sorted(cards.items(), key=extra_key):
+                nk = _norm_card(nm)
+                if nk in want or nm in BASIC_LANDS:
                     continue
                 extras.append(nm)
                 if len(extras) >= 6:
@@ -387,9 +473,10 @@ class MetaEngine:
                     "score": score,
                     "miss": miss,
                     "likely": extras,
+                    "rare": rare_hits,
                 }
             )
-        ranked.sort(key=lambda r: (-r["score"], -r["hits"], r["name"]))
+        ranked.sort(key=lambda r: (-r["score"], -r["hits"], -r.get("rare", 0), r["name"]))
         return ranked
 
 
@@ -586,6 +673,9 @@ def set_always_on_top(root) -> None:
             pass
 
 
+_OBS_SHELL_VER = "obs-shell-v2"
+
+
 class ObsBridge:
     """Write live HTML/text files for an OBS Browser Source."""
 
@@ -593,17 +683,26 @@ class ObsBridge:
         self._lock = threading.Lock()
         self._last_sig = ""
 
+    def _write_data(self, stem: str, inner: str) -> None:
+        payload = "window.__OBS_HTML = " + json.dumps(inner) + ";\n"
+        (OBS_DIR / f"{stem}_data.js").write_text(payload, encoding="utf-8")
+
+    def _ensure_shell(self, stem: str) -> None:
+        path = OBS_DIR / f"{stem}.html"
+        try:
+            if path.exists() and _OBS_SHELL_VER in path.read_text(encoding="utf-8", errors="ignore"):
+                return
+        except Exception:
+            pass
+        path.write_text(self._shell(stem), encoding="utf-8")
+
     def clear(self) -> None:
-        blank = (
-            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-            "<meta http-equiv='refresh' content='1'>"
-            "<style>html,body{margin:0;padding:0;width:480px;height:1080px;background:transparent;}</style>"
-            "</head><body></body></html>"
-        )
         try:
             OBS_DIR.mkdir(exist_ok=True)
-            (OBS_DIR / "playerdeck.html").write_text(blank, encoding="utf-8")
-            (OBS_DIR / "oppdeck.html").write_text(blank, encoding="utf-8")
+            self._ensure_shell("playerdeck")
+            self._ensure_shell("oppdeck")
+            self._write_data("playerdeck", "")
+            self._write_data("oppdeck", "")
             (OBS_DIR / "you.txt").write_text("", encoding="utf-8")
             (OBS_DIR / "opp.txt").write_text("", encoding="utf-8")
             self._last_sig = ""
@@ -643,24 +742,26 @@ class ObsBridge:
             if pred_txt:
                 opp_txt = [pred_txt, ""] + opp_txt
             (OBS_DIR / "opp.txt").write_text("\n".join(opp_txt) + ("\n" if opp_txt else ""), encoding="utf-8")
-            (OBS_DIR / "playerdeck.html").write_text(
-                self._page(str(snap.get("deck_name") or "Your library"), you_lines),
-                encoding="utf-8",
+            self._ensure_shell("playerdeck")
+            self._ensure_shell("oppdeck")
+            self._write_data(
+                "playerdeck",
+                self._inner(str(snap.get("deck_name") or "Your library"), you_lines),
             )
-            (OBS_DIR / "oppdeck.html").write_text(
-                self._page(
+            self._write_data(
+                "oppdeck",
+                self._inner(
                     str(snap.get("opponent_name") or "Opponent"),
                     opp_lines,
                     extra=pred_block,
                 ),
-                encoding="utf-8",
             )
             (OBS_DIR / "README.txt").write_text(
                 "OBS Browser Source size: 480 x 1080 (vertical)\n"
-                "Closing the app blanks playerdeck.html and oppdeck.html.\n"
-                f"{OBS_DIR}\n"
-                "playerdeck.html — your library\n"
-                "oppdeck.html — opponent + meta prediction\n",
+                "Point the source at playerdeck.html / oppdeck.html in this folder.\n"
+                "Do NOT enable Refresh browser on the source — the page updates itself.\n"
+                "Closing the app blanks the card lists.\n"
+                f"{OBS_DIR}\n",
                 encoding="utf-8",
             )
         except Exception:
@@ -703,7 +804,7 @@ class ObsBridge:
         bits.append("</div>")
         return "".join(bits)
 
-    def _page(self, title: str, lines: List[str], extra: str = "") -> str:
+    def _inner(self, title: str, lines: List[str], extra: str = "") -> str:
         if not lines:
             body = "<div class='empty'>no public cards yet</div>"
         else:
@@ -717,10 +818,14 @@ class ObsBridge:
                     bits.append(f"<div class='row r{stripe % 2}'>{_esc(line)}</div>")
                     stripe += 1
             body = "".join(bits)
+        return f"<h1>{_esc(title).upper()}</h1>{extra}{body}"
+
+    def _shell(self, stem: str) -> str:
+        data = f"{stem}_data.js"
         return (
             "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-            "<meta name='viewport' content='width=480, height=1080'>"
-            "<meta http-equiv='refresh' content='1'>"
+            f"<meta name='viewport' content='width=480, height=1080'>"
+            f"<!-- {_OBS_SHELL_VER} -->"
             "<style>"
             "*{box-sizing:border-box;}"
             f"html,body{{margin:0;padding:0;width:{OBS_WIDTH}px;height:{OBS_HEIGHT}px;"
@@ -740,9 +845,20 @@ class ObsBridge:
             ".pn{font-size:18px;font-weight:700;margin-top:3px;}"
             ".ps{font-size:14px;color:#8b8a84;margin-top:2px;}"
             ".pl{font-size:13px;color:#e8e6df;margin-top:4px;}"
-            "</style></head><body><div class='col'>"
-            f"<h1>{_esc(title).upper()}</h1>{extra}{body}"
-            "</div></body></html>"
+            "</style></head><body><div class='col' id='root'></div>"
+            "<script>"
+            "var last='';"
+            "function paint(){"
+            f"var s=document.createElement('script');"
+            f"s.src='{data}?t='+Date.now();"
+            "s.onload=function(){"
+            "var html=window.__OBS_HTML||'';"
+            "if(html!==last){last=html;document.getElementById('root').innerHTML=html;}"
+            "};"
+            "document.head.appendChild(s);"
+            "}"
+            "paint();setInterval(paint,400);"
+            "</script></body></html>"
         )
 
 

@@ -36,6 +36,22 @@ def main() -> None:
         state.start_counts = counts
         state.deck_name = "Izzet Demo"
         state.status = "Demo mode — not reading Arena"
+        # Sample keep so the opening-hand panel is visible without Arena.
+        state.mulligan_active = True
+        state.mulligan_on_play = True
+        state.mulligan_advice = {
+            "verdict": "KEEP",
+            "score": 78,
+            "lands": 3,
+            "spells": 4,
+            "on_play": True,
+            "mulligan_count": 0,
+            "reasons": ["on the play", "three lands", "has a 1–2 drop"],
+            "bottom": [],
+            "hand": ["Mountain", "Island", "Steam Vents", "Consider", "Lightning Strike", "Spirebluff Canal", "Torch the Tower"],
+            "grouping": False,
+            "bottom_needed": 0,
+        }
     elif args.deck:
         text = Path(args.deck).read_text(encoding="utf-8", errors="ignore")
         counts, _ = parse_deck_text(text, names)
